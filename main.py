@@ -731,6 +731,7 @@ def main():
 
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("s", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("symbol", set_symbol))
     app.add_handler(CommandHandler("threshold", set_threshold))
