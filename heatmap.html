@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Liquidity Heatmap</title>
+<style>
+  :root{
+    --bg:#080a10;
+    --panel:#0d1119;
+    --line:#1c2230;
+    --text:#e4e7ec;
+    --muted:#7c8798;
+    --price-line:#eafcff;
+    --up:#3ddc84;
+    --down:#ff5c5c;
+    --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{
+    margin:0; padding:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:var(--sans); overflow:hidden;
+    -webkit-user-select:none; user-select:none;
+  }
+  #app{
+    display:flex; flex-direction:column; height:100vh; height:100dvh;
+    padding-top:env(safe-area-inset-top); padding-bottom:env(safe-area-inset-bottom);
+  }
+
+  /* ---- top bar ---- */
+  #topbar{
+    display:flex; align-items:center; gap:10px;
+    padding:10px 12px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex-wrap:wrap;
+  }
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; transition:background .3s;}
+  .dot.live{background:var(--up); box-shadow:0 0 6px var(--up);}
+  .dot.warn{background:#ffb347; box-shadow:0 0 6px #ffb347;}
+  #symbolLabel{font-family:var(--mono); font-weight:600; font-size:14px; letter-spacing:.02em;}
+  .field{
+    display:flex; align-items:center; gap:4px; background:#131826; border:1px solid var(--line);
+    border-radius:8px; padding:4px 8px;
+  }
+  .field label{font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em;}
+  .field input{
+    width:64px; background:transparent; border:none; color:var(--text); font-family:var(--mono);
+    font-size:13px; outline:none;
+  }
+  #applyBtn{
+    background:#1a2233; border:1px solid var(--line); color:var(--text); border-radius:8px;
+    padding:6px 12px; font-size:12px; font-family:var(--sans); font-weight:600; cursor:pointer;
+  }
+  #applyBtn:active{background:#232d44;}
+  #controlsToggle{
+    margin-left:auto; background:none; border:1px solid var(--line); color:var(--muted);
+    border-radius:8px; width:30px; height:30px; font-size:14px; cursor:pointer;
+  }
+
+  /* ---- chart area ---- */
+  #chartWrap{ position:relative; flex:1; min-height:0; touch-action:none; }
+  #heatCanvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #overlayCanvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
+
+  #liveBtn{
+    position:absolute; left:8px; bottom:8px; display:flex; align-items:center; gap:5px;
+    background:rgba(13,17,25,0.8); border:1px solid var(--line); color:var(--muted);
+    border-radius:8px; padding:6px 10px; font-family:var(--mono); font-size:11px;
+    font-weight:600; letter-spacing:.04em;
+  }
+  #liveBtn.on{ color:var(--up); border-color:rgba(61,220,132,0.4); }
+  #liveBtn.off{ color:#ffb347; border-color:rgba(255,179,71,0.4); }
+
+  #syncMsg{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:8px; color:var(--muted); font-family:var(--mono); font-size:13px;
+    background:rgba(8,10,16,0.85);
+  }
+  #syncMsg.hidden{ display:none; }
+  .spinner{
+    width:22px; height:22px; border-radius:50%; border:2px solid var(--line);
+    border-top-color:#ffb347; animation:spin 0.8s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  /* ---- bottom status bar ---- */
+  #statusbar{
+    display:flex; align-items:center; gap:14px; padding:7px 12px; background:var(--panel);
+    border-top:1px solid var(--line); font-family:var(--mono); font-size:11px; color:var(--muted);
+    white-space:nowrap; overflow-x:auto;
+  }
+  #statusbar b{ color:var(--text); font-weight:600; }
+
+  /* ---- legend ---- */
+  #legend{
+    position:absolute; right:8px; bottom:8px; display:flex; align-items:center; gap:6px;
+    background:rgba(13,17,25,0.75); border:1px solid var(--line); border-radius:8px;
+    padding:5px 8px; font-family:var(--mono); font-size:9px; color:var(--muted);
+  }
+  #legendBar{
+    width:70px; height:8px; border-radius:4px;
+    background:linear-gradient(90deg, #0b1a33, #0e5b73, #14a3a3, #ffb347, #ff3b30, #fff4e0);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="topbar">
+    <span class="dot" id="statusDot"></span>
+    <span id="symbolLabel">BTCUSDT</span>
+
+    <button id="controlsToggle">⚙</button>
+  </div>
+
+  <div id="controlsPanel" style="display:none; padding:10px 12px; background:var(--panel); border-bottom:1px solid var(--line); gap:8px; flex-wrap:wrap; align-items:center;">
+    <div class="field"><label>Symbol</label><input id="inSymbol" type="text" value="BTCUSDT" autocapitalize="characters"></div>
+    <div class="field"><label>Range ±</label><input id="inRange" type="number" value="3000"></div>
+    <div class="field"><label>Big ≥</label><input id="inThreshold" type="number" value="20"></div>
+    <div class="field"><label>Speed</label>
+      <select id="inSpeed" style="background:transparent;color:var(--text);border:none;font-family:var(--mono);font-size:13px;outline:none;">
+        <option value="1000">1s</option>
+        <option value="2000" selected>2s</option>
+        <option value="5000">5s</option>
+      </select>
+    </div>
+    <button id="applyBtn">Apply</button>
+  </div>
+
+  <div id="chartWrap">
+    <canvas id="heatCanvas"></canvas>
+    <canvas id="overlayCanvas"></canvas>
+    <div id="syncMsg"><div class="spinner"></div><div id="syncMsgText">Connecting to Binance…</div></div>
+    <div id="legend"><span>small</span><div id="legendBar"></div><span>big wall</span></div>
+    <button id="liveBtn">● LIVE</button>
+  </div>
+
+  <div id="statusbar">
+    <span>● <b id="stConn">connecting</b></span>
+    <span>levels <b id="stLevels">–</b></span>
+    <span>updated <b id="stAge">–</b></span>
+    <span>price <b id="stPrice">–</b></span>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+  const state = {
+    symbol: "BTCUSDT",
+    rangeAbs: 3000,
+    thresholdBig: 20,     // base-asset units per row-bucket to trigger "big" hot color
+    intervalMs: 2000,
+    numRows: 160,
+    viewCols: 150,         // how many columns are visible on screen at once (zoomable)
+    maxHistory: 3000,      // how many columns we keep in memory total (scrollable history)
+    viewOffset: 0,         // index into history where the visible window starts
+    following: true,       // true = auto-track newest column (like "live" chat autoscroll)
+    bids: new Map(),
+    asks: new Map(),
+    ready: false,
+    lastUpdateId: null,
+    lastMessageTs: 0,
+    ws: null,
+    wsGeneration: 0,      // bumped on every (re)connect so stale sockets/timers self-cancel
+  };
+
+  let columns = [];        // full rolling history buffer of Float32Array(numRows) liquidity sums
+  let colMidPrices = [];   // mid price at time each column was sampled (for price-line trail)
+
+  // ---------------------------------------------------------------------
+  // DOM refs
+  // ---------------------------------------------------------------------
+  const heatCanvas = document.getElementById("heatCanvas");
+  const overlayCanvas = document.getElementById("overlayCanvas");
+  const heatCtx = heatCanvas.getContext("2d");
+  const overlayCtx = overlayCanvas.getContext("2d");
+  const syncMsg = document.getElementById("syncMsg");
+  const syncMsgText = document.getElementById("syncMsgText");
+  const statusDot = document.getElementById("statusDot");
+  const symbolLabel = document.getElementById("symbolLabel");
+  const stConn = document.getElementById("stConn");
+  const stLevels = document.getElementById("stLevels");
+  const stAge = document.getElementById("stAge");
+  const stPrice = document.getElementById("stPrice");
+  const controlsToggle = document.getElementById("controlsToggle");
+  const controlsPanel = document.getElementById("controlsPanel");
+  const applyBtn = document.getElementById("applyBtn");
+  const liveBtn = document.getElementById("liveBtn");
+  const chartWrap = document.getElementById("chartWrap");
+
+  // low-res offscreen buffer we scale up for a smooth glow look
+  const off = document.createElement("canvas");
+  const offCtx = off.getContext("2d");
+
+  // ---------------------------------------------------------------------
+  // Canvas sizing
+  // ---------------------------------------------------------------------
+  function resizeCanvases() {
+    const wrap = document.getElementById("chartWrap");
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    for (const c of [heatCanvas, overlayCanvas]) {
+      c.width = w * dpr; c.height = h * dpr;
+      c.style.width = w + "px"; c.style.height = h + "px";
+    }
+    heatCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", resizeCanvases);
+
+  // ---------------------------------------------------------------------
+  // Color mapping — "ember" scale: indigo -> teal -> amber -> red -> white-hot
+  // ---------------------------------------------------------------------
+  const STOPS = [
+    { t: 0.00, c: [8, 10, 16] },      // background-ish, near nothing
+    { t: 0.18, c: [11, 26, 51] },     // deep indigo
+    { t: 0.38, c: [14, 91, 115] },    // teal
+    { t: 0.60, c: [20, 163, 163] },   // cyan-teal
+    { t: 0.80, c: [255, 179, 71] },   // amber (approaching "big")
+    { t: 1.00, c: [255, 59, 48] },    // hot red (big wall)
+  ];
+  const HOT = [255, 244, 224]; // white-hot, used past the "big" threshold itself
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function colorForRatio(ratio) {
+    // ratio in [0,1] against the "normal" scale (pre-threshold)
+    ratio = Math.max(0, Math.min(1, ratio));
+    for (let i = 1; i < STOPS.length; i++) {
+      if (ratio <= STOPS[i].t) {
+        const a = STOPS[i - 1], b = STOPS[i];
+        const localT = (ratio - a.t) / (b.t - a.t || 1);
+        return [
+          lerp(a.c[0], b.c[0], localT),
+          lerp(a.c[1], b.c[1], localT),
+          lerp(a.c[2], b.c[2], localT),
+        ];
+      }
+    }
+    return STOPS[STOPS.length - 1].c;
+  }
+
+  function colorForValue(value, thresholdBig) {
+    if (value <= 0) return STOPS[0].c;
+    if (value >= thresholdBig) {
+      // scale further into white-hot the further past threshold, capped
+      const over = Math.min(1, (value - thresholdBig) / (thresholdBig * 1.5 + 1e-6));
+      const red = STOPS[STOPS.length - 1].c;
+      return [
+        lerp(red[0], HOT[0], over),
+        lerp(red[1], HOT[1], over),
+        lerp(red[2], HOT[2], over),
+      ];
+    }
+    // log-ish scale under threshold so mid-size walls are still visible
+    const ratio = Math.log(1 + value) / Math.log(1 + thresholdBig);
+    return colorForRatio(ratio);
+  }
+
+  // ---------------------------------------------------------------------
+  // Binance order book sync (mirrors the bot's Python logic, in JS)
+  // ---------------------------------------------------------------------
+  async function connect(symbol) {
+    const myGen = ++state.wsGeneration;
+    state.ready = false;
+    state.bids = new Map();
+    state.asks = new Map();
+    columns = [];
+    colMidPrices = [];
+    state.viewOffset = 0;
+    state.following = true;
+    if (typeof updateLiveBtn === "function") updateLiveBtn();
+    syncMsg.classList.remove("hidden");
+    syncMsgText.textContent = `Connecting to ${symbol}…`;
+    statusDot.className = "dot warn";
+    stConn.textContent = "syncing";
+
+    const streamName = `${symbol.toLowerCase()}@depth@500ms`;
+    const url = `wss://fstream.binance.com/stream?streams=${streamName}`;
+
+    function scheduleReconnect(delayMs) {
+      if (myGen !== state.wsGeneration) return;
+      setTimeout(() => { if (myGen === state.wsGeneration) connect(symbol); }, delayMs);
+    }
+
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      syncMsgText.textContent = "Connection failed, retrying…";
+      scheduleReconnect(2000);
+      return;
+    }
+    state.ws = ws;
+
+    let buffered = [];
+    let snapApplied = false;
+    let lastAppliedU = null;
+    let started = false;
+
+    ws.onmessage = async (ev) => {
+      if (myGen !== state.wsGeneration) return;
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      const event = msg.data;
+      if (!event) return;
+
+      if (!snapApplied) {
+        buffered.push(event);
+        return;
+      }
+      processEvent(event);
+    };
+
+    ws.onerror = () => { /* onclose will fire too, handled there */ };
+
+    ws.onclose = () => {
+      if (myGen !== state.wsGeneration) return;
+      state.ready = false;
+      statusDot.className = "dot warn";
+      stConn.textContent = "reconnecting";
+      syncMsg.classList.remove("hidden");
+      syncMsgText.textContent = "Connection dropped, reconnecting…";
+      scheduleReconnect(1500);
+    };
+
+    function processEvent(event) {
+      if (lastAppliedU !== null && event.u <= lastAppliedU) return;
+      if (!started) {
+        if (lastAppliedU !== null && event.U > lastAppliedU + 1) {
+          try { ws.close(); } catch {}
+          return; // onclose triggers resync
+        }
+        started = true;
+      } else if (event.pu !== lastAppliedU) {
+        try { ws.close(); } catch {}
+        return;
+      }
+      for (const [pStr, qStr] of event.b) {
+        const p = parseFloat(pStr), q = parseFloat(qStr);
+        if (q === 0) state.bids.delete(p); else state.bids.set(p, q);
+      }
+      for (const [pStr, qStr] of event.a) {
+        const p = parseFloat(pStr), q = parseFloat(qStr);
+        if (q === 0) state.asks.delete(p); else state.asks.set(p, q);
+      }
+      lastAppliedU = event.u;
+      state.lastMessageTs = Date.now();
+    }
+
+    // wait a tick for a first buffered event before fetching the snapshot,
+    // matching Binance's documented sync procedure
+    await new Promise(r => setTimeout(r, 250));
+    if (myGen !== state.wsGeneration) return;
+
+    try {
+      const snap = await fetchSnapshot(symbol);
+      if (myGen !== state.wsGeneration) return;
+
+      state.bids = new Map(snap.bids.filter(([, q]) => parseFloat(q) > 0).map(([p, q]) => [parseFloat(p), parseFloat(q)]));
+      state.asks = new Map(snap.asks.filter(([, q]) => parseFloat(q) > 0).map(([p, q]) => [parseFloat(p), parseFloat(q)]));
+      lastAppliedU = snap.lastUpdateId;
+      snapApplied = true;
+
+      for (const ev of buffered) processEvent(ev);
+      buffered = [];
+
+      state.ready = true;
+      syncMsg.classList.add("hidden");
+      statusDot.className = "dot live";
+      stConn.textContent = "live";
+    } catch (e) {
+      console.error("snapshot fetch failed:", e);
+      syncMsgText.textContent = `Couldn't load order book (${e.message || e}) — retrying…`;
+      try { ws.close(); } catch {}
+      scheduleReconnect(3000);
+    }
+  }
+
+  // Binance's REST endpoint sometimes blocks direct browser requests (CORS).
+  // Try direct first; if that fails, fall back through public CORS proxies.
+  async function fetchSnapshot(symbol) {
+    const target = `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=1000`;
+    const attempts = [
+      target,
+      `https://corsproxy.io/?url=${encodeURIComponent(target)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    ];
+    let lastErr;
+    for (const url of attempts) {
+      try {
+        const resp = await fetch(url, { cache: "no-store" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (!data.bids || !data.asks) throw new Error("unexpected response shape");
+        return data;
+      } catch (e) {
+        lastErr = e;
+        console.warn("snapshot attempt failed for", url, e);
+      }
+    }
+    throw lastErr || new Error("all snapshot sources failed");
+  }
+
+  // ---------------------------------------------------------------------
+  // Sampling loop: turn the current book into one heatmap column
+  // ---------------------------------------------------------------------
+  function sampleColumn() {
+    if (!state.ready || state.bids.size === 0 || state.asks.size === 0) return;
+    const bestBid = Math.max(...state.bids.keys());
+    const bestAsk = Math.min(...state.asks.keys());
+    const mid = (bestBid + bestAsk) / 2;
+
+    const lo = mid - state.rangeAbs, hi = mid + state.rangeAbs;
+    const bucketWidth = (hi - lo) / state.numRows;
+    const col = new Float32Array(state.numRows);
+
+    function addToBuckets(map) {
+      for (const [p, q] of map) {
+        if (p < lo || p > hi) continue;
+        let idx = Math.floor((p - lo) / bucketWidth);
+        if (idx < 0) idx = 0;
+        if (idx >= state.numRows) idx = state.numRows - 1;
+        col[idx] += q;
+      }
+    }
+    addToBuckets(state.bids);
+    addToBuckets(state.asks);
+
+    columns.push(col);
+    colMidPrices.push(mid);
+    if (columns.length > state.maxHistory) { columns.shift(); colMidPrices.shift(); if (!state.following) state.viewOffset = Math.max(0, state.viewOffset - 1); }
+
+    if (state.following) {
+      state.viewOffset = Math.max(0, columns.length - state.viewCols);
+    }
+
+    stPrice.textContent = mid.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    stLevels.textContent = (state.bids.size + state.asks.size).toLocaleString();
+  }
+
+  // ---------------------------------------------------------------------
+  // Render loop
+  // ---------------------------------------------------------------------
+  function render() {
+    const wrap = document.getElementById("chartWrap");
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    heatCtx.clearRect(0, 0, w, h);
+    overlayCtx.clearRect(0, 0, w, h);
+
+    if (columns.length > 0) {
+      const rows = state.numRows;
+      const viewCols = Math.min(state.viewCols, columns.length);
+      const start = Math.max(0, Math.min(state.viewOffset, columns.length - viewCols));
+      const visible = columns.slice(start, start + viewCols);
+      const visibleMids = colMidPrices.slice(start, start + viewCols);
+
+      const cols = visible.length;
+      off.width = cols; off.height = rows;
+      const img = offCtx.createImageData(cols, rows);
+
+      for (let ci = 0; ci < cols; ci++) {
+        const col = visible[ci];
+        for (let ri = 0; ri < rows; ri++) {
+          const value = col[ri];
+          const [r, g, b] = colorForValue(value, state.thresholdBig);
+          // row 0 = lowest price -> draw at bottom, so flip vertically
+          const y = rows - 1 - ri;
+          const idx = (y * cols + ci) * 4;
+          img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
+        }
+      }
+      offCtx.putImageData(img, 0, 0);
+
+      heatCtx.imageSmoothingEnabled = true;
+      heatCtx.drawImage(off, 0, 0, cols, rows, 0, 0, w, h);
+
+      // price axis is always centered on the RIGHTMOST visible column's price,
+      // so panning back in time keeps a stable, readable axis
+      const mid = visibleMids[visibleMids.length - 1] || colMidPrices[colMidPrices.length - 1];
+      if (mid) {
+        const lo = mid - state.rangeAbs, hi = mid + state.rangeAbs;
+        overlayCtx.strokeStyle = "rgba(228,231,236,0.06)";
+        overlayCtx.fillStyle = "#7c8798";
+        overlayCtx.font = "10px " + getComputedStyle(document.body).getPropertyValue("--mono");
+        overlayCtx.textBaseline = "middle";
+        const gridLines = 6;
+        for (let i = 0; i <= gridLines; i++) {
+          const price = lo + (hi - lo) * (i / gridLines);
+          const y = h - (h * (i / gridLines));
+          overlayCtx.beginPath();
+          overlayCtx.moveTo(0, y); overlayCtx.lineTo(w, y); overlayCtx.stroke();
+          overlayCtx.fillText(price.toLocaleString(undefined, { maximumFractionDigits: 0 }), w - 62, y);
+        }
+
+        // current price line (glowing)
+        const midY = h - ((mid - lo) / (hi - lo)) * h;
+        overlayCtx.save();
+        overlayCtx.shadowColor = "#eafcff";
+        overlayCtx.shadowBlur = 6;
+        overlayCtx.strokeStyle = "#eafcff";
+        overlayCtx.lineWidth = 1.3;
+        overlayCtx.setLineDash([4, 3]);
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(0, midY); overlayCtx.lineTo(w, midY); overlayCtx.stroke();
+        overlayCtx.restore();
+
+        overlayCtx.setLineDash([]);
+        const label = mid.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        overlayCtx.font = "bold 11px " + getComputedStyle(document.body).getPropertyValue("--mono");
+        const tw = overlayCtx.measureText(label).width;
+        overlayCtx.fillStyle = "#0d1119";
+        overlayCtx.fillRect(w - tw - 16, midY - 9, tw + 12, 18);
+        overlayCtx.strokeStyle = "#eafcff";
+        overlayCtx.lineWidth = 1;
+        overlayCtx.strokeRect(w - tw - 16, midY - 9, tw + 12, 18);
+        overlayCtx.fillStyle = "#eafcff";
+        overlayCtx.fillText(label, w - tw - 10, midY + 1);
+      }
+    }
+
+    requestAnimationFrame(render);
+  }
+
+  // ---------------------------------------------------------------------
+  // Status bar ticker
+  // ---------------------------------------------------------------------
+  setInterval(() => {
+    if (!state.lastMessageTs) { stAge.textContent = "–"; return; }
+    const s = Math.max(0, Math.round((Date.now() - state.lastMessageTs) / 1000));
+    stAge.textContent = s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ago`;
+  }, 1000);
+
+  // ---------------------------------------------------------------------
+  // Wiring up controls
+  // ---------------------------------------------------------------------
+  let sampleTimer = null;
+  function restartSampling() {
+    if (sampleTimer) clearInterval(sampleTimer);
+    sampleTimer = setInterval(sampleColumn, state.intervalMs);
+  }
+
+  function applySettings() {
+    const symbol = document.getElementById("inSymbol").value.trim().toUpperCase() || "BTCUSDT";
+    const range = parseFloat(document.getElementById("inRange").value) || 3000;
+    const threshold = parseFloat(document.getElementById("inThreshold").value) || 20;
+    const speed = parseInt(document.getElementById("inSpeed").value, 10) || 2000;
+
+    state.symbol = symbol;
+    state.rangeAbs = range;
+    state.thresholdBig = threshold;
+    state.intervalMs = speed;
+    symbolLabel.textContent = symbol;
+
+    restartSampling();
+    connect(symbol);
+  }
+
+  applyBtn.addEventListener("click", applySettings);
+  controlsToggle.addEventListener("click", () => {
+    controlsPanel.style.display = controlsPanel.style.display === "none" ? "flex" : "none";
+  });
+
+  function updateLiveBtn() {
+    liveBtn.textContent = state.following ? "● LIVE" : "◷ paused — tap to follow";
+    liveBtn.className = state.following ? "on" : "off";
+  }
+  function goLive() {
+    state.following = true;
+    state.viewOffset = Math.max(0, columns.length - state.viewCols);
+    updateLiveBtn();
+  }
+  liveBtn.addEventListener("click", goLive);
+  updateLiveBtn();
+
+  // ---------------------------------------------------------------------
+  // Drag to pan through history, pinch to zoom the time axis
+  // ---------------------------------------------------------------------
+  const pointers = new Map(); // pointerId -> {x,y}
+  let dragStartX = null, dragStartOffset = 0;
+  let pinchStartDist = null, pinchStartViewCols = state.viewCols;
+
+  function colWidthPx() { return chartWrap.clientWidth / state.viewCols; }
+
+  chartWrap.addEventListener("pointerdown", (e) => {
+    chartWrap.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      dragStartX = e.clientX;
+      dragStartOffset = state.viewOffset;
+    } else if (pointers.size === 2) {
+      const pts = [...pointers.values()];
+      pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      pinchStartViewCols = state.viewCols;
+    }
+  });
+
+  chartWrap.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointers.size === 2) {
+      const pts = [...pointers.values()];
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (pinchStartDist) {
+        const scale = pinchStartDist / Math.max(dist, 1); // pinch out -> smaller viewCols -> zoom in
+        let newViewCols = Math.round(pinchStartViewCols * scale);
+        newViewCols = Math.max(30, Math.min(400, newViewCols, columns.length || 400));
+        state.viewCols = newViewCols;
+        if (state.following) state.viewOffset = Math.max(0, columns.length - state.viewCols);
+      }
+      return;
+    }
+
+    if (dragStartX !== null) {
+      const dx = e.clientX - dragStartX;
+      const colDelta = Math.round(dx / colWidthPx());
+      const maxOffset = Math.max(0, columns.length - state.viewCols);
+      const newOffset = Math.max(0, Math.min(maxOffset, dragStartOffset - colDelta));
+      if (newOffset !== state.viewOffset) {
+        state.viewOffset = newOffset;
+        state.following = newOffset >= maxOffset;
+        updateLiveBtn();
+      }
+    }
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinchStartDist = null;
+    if (pointers.size === 0) dragStartX = null;
+  }
+  chartWrap.addEventListener("pointerup", endPointer);
+  chartWrap.addEventListener("pointercancel", endPointer);
+
+  // ---------------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------------
+  resizeCanvases();
+  connect(state.symbol);
+  restartSampling();
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
