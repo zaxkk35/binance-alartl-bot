@@ -52,7 +52,7 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
 ICT_TZ = ZoneInfo("Asia/Bangkok")  # UTC+7, used for /time
 
-CLUSTER_PRESETS = {"low": 0.02, "mid": 0.05, "high": 0.15}
+CLUSTER_PRESETS = {"exact": 0.0, "low": 0.02, "mid": 0.05, "high": 0.15}
 
 DEFAULTS = {
     "symbol": "BTCUSDT",
@@ -425,6 +425,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
 def cluster_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
+            InlineKeyboardButton("Exact", callback_data="cluster:exact"),
             InlineKeyboardButton("Low", callback_data="cluster:low"),
             InlineKeyboardButton("Mid", callback_data="cluster:mid"),
             InlineKeyboardButton("High", callback_data="cluster:high"),
@@ -689,7 +690,7 @@ HELP_TEXT = (
     "/symbol SYM — set trading pair (e.g. BTCUSDT)\n"
     "/threshold N — min wall size, in base asset\n"
     "/range N — ± price points around current price\n"
-    "/cluster low|mid|high — wall grouping tightness\n"
+    "/cluster exact|low|mid|high — wall grouping tightness\n"
     "/receive — snapshot now\n"
     "/get — snapshot now, with wall age\n"
     "/liq — nearest big wall to current price\n"
@@ -767,7 +768,7 @@ async def set_cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Pick a cluster tightness:", reply_markup=cluster_keyboard())
         return
     if context.args[0].lower() not in CLUSTER_PRESETS:
-        await update.message.reply_text("Usage: /cluster low | mid | high")
+        await update.message.reply_text("Usage: /cluster exact | low | mid | high")
         return
     level = context.args[0].lower()
     await update_setting(chat_id, "cluster_level", level)
