@@ -4,17 +4,18 @@ Binance Big Order (Whale Wall) Telegram Bot
 Maintains a LIVE local order book per watched symbol via Binance's
 USDT-M Futures diff-depth websocket stream on top of an initial REST
 snapshot (Binance's official local order book procedure). Reports
-clustered buy/sell walls above a user-defined size, within a fixed
+EXACT resting buy/sell walls (no clustering/merging) within a fixed
 price-point range of the current price -- on demand, on a daily
 schedule, and/or as live push alerts when a new big wall appears.
 
-Also includes an optional AI chat mode (/chat) powered by Google's
-free Gemini API, for general Q&A inside the same bot.
+Also includes:
+  /liq     -- nearest big wall (>=300 base-asset units) on each side
+  /ta      -- RSI / EMA / Fibonacci technicals + wall confluence
+  /signal  -- simplified order-block + fib retracement entry read
 
 Run:
     pip install -r requirements.txt
     export TELEGRAM_BOT_TOKEN="123456:ABC..."
-    export GEMINI_API_KEY="AIza..."       # optional, only needed for /chat
     python main.py
 """
 
@@ -36,8 +37,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 logging.basicConfig(
@@ -47,22 +46,20 @@ log = logging.getLogger("wall-bot")
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BINANCE_WS_BASE = "wss://fstream.binance.com/stream"
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
 ICT_TZ = ZoneInfo("Asia/Bangkok")  # UTC+7, used for /time
 
-CLUSTER_PRESETS = {"exact": 0.0, "low": 0.02, "mid": 0.05, "high": 0.15}
+EXACT_CLUSTER_PCT = 0.0   # no merging -- raw tick-level wall data, like ATAS
+LIQ_THRESHOLD = 300.0     # /liq only looks at walls >= this size (base asset units)
+FIB_RATIOS = [0.236, 0.382, 0.5, 0.618, 0.786]
+QUICK_SYMBOLS = ["BTC", "SOL", "ZEC", "HYPE", "BNB"]
 
 DEFAULTS = {
     "symbol": "BTCUSDT",
     "threshold_qty": 5.0,     # min resting size, in base-asset units (e.g. BTC), to count as a wall
     "range_abs": 3000.0,      # only show orders within +/- this many price points of current price
-    "top_n": 5,               # max walls to show per side
-    "cluster_level": "mid",   # low / mid / high -> CLUSTER_PRESETS
     "daily_time": None,       # "HH:MM" 24h, Bangkok time, or None if off
     "alert_on": False,        # live push when a new wall crosses threshold
-    "chat_mode": False,       # AI chat mode via /chat
 }
 
 # ---------------------------------------------------------------------------
@@ -294,43 +291,26 @@ book_manager = BookManager()
 
 
 # ---------------------------------------------------------------------------
-# Wall detection (clustering) -- works on live book snapshot
+# Wall detection -- EXACT mode, no clustering/merging (matches ATAS raw ticks)
 # ---------------------------------------------------------------------------
-def cluster_levels(items, first_seen_map, lower_bound, upper_bound, cluster_pct, threshold_qty, top_n):
+def cluster_levels(items, first_seen_map, lower_bound, upper_bound, threshold_qty):
     """items: iterable of (price, qty) floats.
-    Groups levels within `cluster_pct`% of each other into one merged wall.
-    Returns list of (avg_price, total_qty, oldest_first_seen_ts), largest first."""
+    With EXACT_CLUSTER_PCT this returns every individual price tick above
+    threshold, unmerged. Returns list of (price, qty, first_seen_ts), no cap."""
     now = time.time()
-    in_range = [(p, q) for p, q in items if lower_bound <= p <= upper_bound and q > 0]
-    if not in_range:
-        return []
-    in_range.sort(key=lambda x: x[0])
-
-    clusters = []  # [weighted_price_sum, total_qty, oldest_ts]
-    for p, q in in_range:
-        ts = first_seen_map.get(p, now)
-        if clusters:
-            last = clusters[-1]
-            cluster_ref_price = last[0] / last[1]
-            if abs(p - cluster_ref_price) / cluster_ref_price * 100 <= cluster_pct:
-                last[0] += p * q
-                last[1] += q
-                last[2] = min(last[2], ts)
-                continue
-        clusters.append([p * q, q, ts])
-
     walls = []
-    for weighted_price_sum, total_qty, oldest_ts in clusters:
-        if total_qty >= threshold_qty:
-            walls.append((weighted_price_sum / total_qty, total_qty, oldest_ts))
-
+    for p, q in items:
+        if not (lower_bound <= p <= upper_bound) or q <= 0:
+            continue
+        if q >= threshold_qty:
+            walls.append((p, q, first_seen_map.get(p, now)))
     walls.sort(key=lambda w: w[1], reverse=True)
-    return walls[:top_n]
+    return walls
 
 
-async def get_big_walls(symbol: str, threshold_qty: float, range_abs: float, top_n: int, cluster_pct: float):
+async def get_big_walls(symbol: str, threshold_qty: float, range_abs: float):
     """Returns (ready, mid_price, buy_walls, sell_walls).
-    Each wall is (price, qty, first_seen_ts)."""
+    Each wall is (price, qty, first_seen_ts). No limit on count."""
     book = await book_manager.ensure(symbol)
     try:
         await asyncio.wait_for(book.ready.wait(), timeout=8)
@@ -345,13 +325,13 @@ async def get_big_walls(symbol: str, threshold_qty: float, range_abs: float, top
     lower_bound = mid_price - range_abs
     upper_bound = mid_price + range_abs
 
-    buy_walls = cluster_levels(bids.items(), bid_fs, lower_bound, upper_bound, cluster_pct, threshold_qty, top_n)
-    sell_walls = cluster_levels(asks.items(), ask_fs, lower_bound, upper_bound, cluster_pct, threshold_qty, top_n)
+    buy_walls = cluster_levels(bids.items(), bid_fs, lower_bound, upper_bound, threshold_qty)
+    sell_walls = cluster_levels(asks.items(), ask_fs, lower_bound, upper_bound, threshold_qty)
     return True, mid_price, buy_walls, sell_walls
 
 
-def zone_key(price: float, mid_price: float, cluster_pct: float) -> int:
-    width = max(mid_price * cluster_pct / 100 * 2, 0.0001)
+def zone_key(price: float, mid_price: float) -> int:
+    width = max(mid_price * 0.0002, 0.0001)  # tight fixed zone width for alert de-dupe
     return round(price / width)
 
 
@@ -367,7 +347,7 @@ def fmt_qty(n: float) -> str:
 def build_report(symbol, price, buy_walls, sell_walls, threshold_qty, range_abs, show_age=False) -> str:
     asset = base_asset(symbol)
     lines = [
-        f"📊 *{symbol}* live wall scan",
+        f"📊 *{symbol}* live wall scan (exact)",
         f"Threshold: ≥ {fmt_qty(threshold_qty)} {asset}  |  Range: `{price - range_abs:,.0f}` – `{price + range_abs:,.0f}`",
         "",
     ]
@@ -385,7 +365,10 @@ def build_report(symbol, price, buy_walls, sell_walls, threshold_qty, range_abs,
     else:
         lines.append("  none found")
 
-    lines.append(f"────  `{price:,.2f}`  (current price)  ────")
+    # Clearly separated current-price divider so it doesn't blend into the wall list
+    lines.append("")
+    lines.append(f"📍  *{price:,.2f}*  ← current price")
+    lines.append("")
 
     lines.append("🟢 *Buy walls*")
     if buy_walls:
@@ -405,6 +388,10 @@ def action_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🕒 Get", callback_data="get"),
             ],
             [InlineKeyboardButton("📡 Status", callback_data="status")],
+            [
+                InlineKeyboardButton("📐 TA", callback_data="ta"),
+                InlineKeyboardButton("🎯 Signal", callback_data="signal"),
+            ],
         ]
     )
 
@@ -417,19 +404,12 @@ def start_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🕒 Get", callback_data="get"),
             ],
             [InlineKeyboardButton("📡 Status", callback_data="status")],
+            [
+                InlineKeyboardButton("📐 TA", callback_data="ta"),
+                InlineKeyboardButton("🎯 Signal", callback_data="signal"),
+            ],
             [InlineKeyboardButton("📖 Help", callback_data="help")],
         ]
-    )
-
-
-def cluster_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Exact", callback_data="cluster:exact"),
-            InlineKeyboardButton("Low", callback_data="cluster:low"),
-            InlineKeyboardButton("Mid", callback_data="cluster:mid"),
-            InlineKeyboardButton("High", callback_data="cluster:high"),
-        ]]
     )
 
 
@@ -446,15 +426,29 @@ def timeoff_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Turn off daily report", callback_data="timeoff")]])
 
 
+def symbol_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(sym, callback_data=f"symbol:{sym}USDT") for sym in QUICK_SYMBOLS[:3]],
+            [InlineKeyboardButton(sym, callback_data=f"symbol:{sym}USDT") for sym in QUICK_SYMBOLS[3:]]]
+    rows[-1].append(InlineKeyboardButton("Others…", callback_data="symbol:others"))
+    return InlineKeyboardMarkup(rows)
+
+
+def signal_interval_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("1H", callback_data="signal:1h"),
+            InlineKeyboardButton("4H", callback_data="signal:4h"),
+            InlineKeyboardButton("8H", callback_data="signal:8h"),
+        ]]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core fetch used by /receive, /get, scheduled reports
 # ---------------------------------------------------------------------------
 async def _do_receive(chat_id: int, show_age: bool = False) -> str:
     s = await get_settings(chat_id)
-    cluster_pct = CLUSTER_PRESETS.get(s["cluster_level"], CLUSTER_PRESETS["mid"])
-    ready, price, buy_walls, sell_walls = await get_big_walls(
-        s["symbol"], s["threshold_qty"], s["range_abs"], s["top_n"], cluster_pct
-    )
+    ready, price, buy_walls, sell_walls = await get_big_walls(s["symbol"], s["threshold_qty"], s["range_abs"])
     if not ready:
         return (
             f"⏳ Still syncing the *{s['symbol']}* order book — try again in a few seconds.\n"
@@ -483,30 +477,269 @@ async def _do_status(chat_id: int) -> str:
 
 async def _do_liq(chat_id: int) -> str:
     s = await get_settings(chat_id)
-    cluster_pct = CLUSTER_PRESETS.get(s["cluster_level"], CLUSTER_PRESETS["mid"])
-    ready, price, buy_walls, sell_walls = await get_big_walls(
-        s["symbol"], s["threshold_qty"], s["range_abs"], s["top_n"], cluster_pct
-    )
+    ready, price, buy_walls, sell_walls = await get_big_walls(s["symbol"], LIQ_THRESHOLD, s["range_abs"])
     if not ready:
         return f"⏳ Still syncing the *{s['symbol']}* order book — try again in a few seconds."
 
-    all_walls = [("sell", p, q) for p, q, _ in sell_walls] + [("buy", p, q) for p, q, _ in buy_walls]
-    if not all_walls:
-        return f"No wall found ≥ {fmt_qty(s['threshold_qty'])} {base_asset(s['symbol'])} within range right now."
-
-    side, p, q = min(all_walls, key=lambda w: abs(w[1] - price))
     asset = base_asset(s["symbol"])
-    dist = p - price
-    dist_pct = dist / price * 100
-    icon = "🔴" if side == "sell" else "🟢"
-    direction = "above" if dist > 0 else "below"
-    return (
-        f"🧲 *Liquidity Magnet* — `{s['symbol']}`\n"
-        f"Current price: `{price:,.2f}`\n\n"
-        f"{icon} Nearest wall: `{p:,.2f}` ({side})\n"
-        f"Size: {fmt_qty(q)} {asset}\n"
-        f"Distance: {abs(dist):,.0f} points {direction} ({dist_pct:+.2f}%)"
-    )
+    lines = [
+        f"🧲 *Liquidity Magnet* — `{s['symbol']}`",
+        f"Current price: `{price:,.2f}`  |  Looking for walls ≥ {fmt_qty(LIQ_THRESHOLD)} {asset}",
+        "",
+    ]
+
+    if sell_walls:
+        p, q, _ = min(sell_walls, key=lambda w: abs(w[0] - price))
+        dist = p - price
+        lines.append(f"🔴 Nearest big sell: `{p:,.2f}` → {fmt_qty(q)} {asset}  (+{dist:,.0f} pts, {dist/price*100:+.2f}%)")
+    else:
+        lines.append(f"🔴 No sell wall ≥ {fmt_qty(LIQ_THRESHOLD)} {asset} found in range.")
+
+    if buy_walls:
+        p, q, _ = min(buy_walls, key=lambda w: abs(w[0] - price))
+        dist = price - p
+        lines.append(f"🟢 Nearest big buy: `{p:,.2f}` → {fmt_qty(q)} {asset}  (-{dist:,.0f} pts, {-dist/price*100:+.2f}%)")
+    else:
+        lines.append(f"🟢 No buy wall ≥ {fmt_qty(LIQ_THRESHOLD)} {asset} found in range.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Klines + technical indicators (for /ta and /signal)
+# ---------------------------------------------------------------------------
+async def fetch_klines(symbol: str, interval: str, limit: int = 200):
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+        )
+        r.raise_for_status()
+        raw = r.json()
+    return [
+        {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+        for k in raw
+    ]
+
+
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
+def fib_from_swing(highs, lows, lookback):
+    lookback = min(lookback, len(highs))
+    recent_highs = highs[-lookback:]
+    recent_lows = lows[-lookback:]
+    hi = max(recent_highs)
+    hi_idx = len(highs) - lookback + recent_highs.index(hi)
+    lo = min(recent_lows)
+    lo_idx = len(lows) - lookback + recent_lows.index(lo)
+    direction = "up" if hi_idx > lo_idx else "down"
+    if direction == "up":
+        levels = {r: hi - (hi - lo) * r for r in FIB_RATIOS}
+    else:
+        levels = {r: lo + (hi - lo) * r for r in FIB_RATIOS}
+    return direction, lo, hi, levels
+
+
+def find_order_block_signal(klines):
+    """Simplified ICT-style order block + fib confluence.
+    Not a precise replica of manual chart reading -- a heuristic read."""
+    n = len(klines)
+    if n < 20:
+        return None
+    highs = [k["high"] for k in klines]
+    lows = [k["low"] for k in klines]
+    closes = [k["close"] for k in klines]
+    opens = [k["open"] for k in klines]
+
+    swing_highs, swing_lows = [], []
+    for i in range(3, n - 3):
+        if highs[i] == max(highs[i - 3:i + 4]):
+            swing_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i - 3:i + 4]):
+            swing_lows.append((i, lows[i]))
+    if not swing_highs or not swing_lows:
+        return None
+
+    last_sh_idx, last_sh_price = swing_highs[-1]
+    last_sl_idx, last_sl_price = swing_lows[-1]
+
+    bullish_bos_idx = next((i for i in range(last_sh_idx + 1, n) if closes[i] > last_sh_price), None)
+    bearish_bos_idx = next((i for i in range(last_sl_idx + 1, n) if closes[i] < last_sl_price), None)
+
+    candidates = []
+    if bullish_bos_idx is not None:
+        candidates.append(("bullish", bullish_bos_idx, last_sh_idx))
+    if bearish_bos_idx is not None:
+        candidates.append(("bearish", bearish_bos_idx, last_sl_idx))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    direction, bos_idx, swing_idx = candidates[0]
+
+    ob_idx = None
+    rng = range(bos_idx - 1, swing_idx - 1, -1)
+    for i in rng:
+        if direction == "bullish" and closes[i] < opens[i]:
+            ob_idx = i
+            break
+        if direction == "bearish" and closes[i] > opens[i]:
+            ob_idx = i
+            break
+    if ob_idx is None:
+        ob_idx = swing_idx
+
+    ob_low, ob_high = lows[ob_idx], highs[ob_idx]
+
+    if direction == "bullish":
+        leg_low = ob_low
+        leg_high = max(highs[bos_idx:n])
+        levels = {r: leg_high - (leg_high - leg_low) * r for r in FIB_RATIOS}
+    else:
+        leg_high = ob_high
+        leg_low = min(lows[bos_idx:n])
+        levels = {r: leg_low + (leg_high - leg_low) * r for r in FIB_RATIOS}
+
+    matches = [(r, p) for r, p in levels.items() if ob_low <= p <= ob_high]
+    if matches:
+        matches.sort(key=lambda m: m[0], reverse=True)
+        entry_ratio, entry_price = matches[0]
+        note = f"{int(entry_ratio*100)}% fib lands inside the order block"
+    else:
+        entry_price = (ob_low + ob_high) / 2
+        note = "no fib level falls inside the order block — using its midpoint"
+
+    return {
+        "direction": direction, "ob_low": ob_low, "ob_high": ob_high,
+        "levels": levels, "entry": entry_price, "note": note,
+        "current_price": closes[-1],
+    }
+
+
+async def _do_ta(chat_id: int) -> str:
+    s = await get_settings(chat_id)
+    symbol = s["symbol"]
+    try:
+        klines = await fetch_klines(symbol, "1h", 200)
+    except Exception as e:
+        return f"❌ Couldn't load candles for `{symbol}`: {e}"
+
+    closes = [k["close"] for k in klines]
+    highs = [k["high"] for k in klines]
+    lows = [k["low"] for k in klines]
+    price = closes[-1]
+
+    rsi = compute_rsi(closes, 14)
+    ema9, ema21, ema50 = compute_ema(closes, 9), compute_ema(closes, 21), compute_ema(closes, 50)
+
+    if rsi is None or ema50 is None:
+        return "⏳ Not enough candle history yet for a full read — try again shortly."
+
+    if price > ema9 > ema21 > ema50:
+        trend = "🟢 bullish (price above EMA9/21/50, all rising order)"
+    elif price < ema9 < ema21 < ema50:
+        trend = "🔴 bearish (price below EMA9/21/50, all falling order)"
+    else:
+        trend = "🟡 mixed / no clean trend"
+
+    if rsi >= 70:
+        rsi_note = "overbought"
+    elif rsi <= 30:
+        rsi_note = "oversold"
+    else:
+        rsi_note = "neutral"
+
+    direction, lo, hi, levels = fib_from_swing(highs, lows, lookback=80)
+
+    ready, _, buy_walls, sell_walls = await get_big_walls(symbol, s["threshold_qty"], s["range_abs"])
+    confluences = []
+    if ready:
+        all_walls = [(p, q, "buy") for p, q, _ in buy_walls] + [(p, q, "sell") for p, q, _ in sell_walls]
+        for r, lvl in levels.items():
+            for p, q, side in all_walls:
+                if lvl > 0 and abs(p - lvl) / lvl * 100 <= 0.15:
+                    confluences.append((r, lvl, p, q, side))
+
+    asset = base_asset(symbol)
+    lines = [
+        f"📐 *{symbol}* — 1H Technicals",
+        f"Price: `{price:,.2f}`",
+        f"RSI(14): {rsi:.1f} ({rsi_note})",
+        f"EMA9 `{ema9:,.2f}`  EMA21 `{ema21:,.2f}`  EMA50 `{ema50:,.2f}`",
+        f"Trend: {trend}",
+        "",
+        f"*Fibonacci* (swing {'low → high' if direction == 'up' else 'high → low'}: `{lo:,.2f}` – `{hi:,.2f}`)",
+    ]
+    for r in FIB_RATIOS:
+        lines.append(f"  {r*100:.1f}%  →  `{levels[r]:,.2f}`")
+
+    if confluences:
+        lines.append("")
+        lines.append("🎯 *Confluence*")
+        for r, lvl, p, q, side in confluences:
+            icon = "🟢" if side == "buy" else "🔴"
+            lines.append(f"  {icon} {r*100:.1f}% fib (`{lvl:,.2f}`) lines up with a {fmt_qty(q)} {asset} {side} wall at `{p:,.2f}`")
+
+    lines.append("")
+    lines.append("_Not financial advice — a simplified technical read, verify against your own charts._")
+    return "\n".join(lines)
+
+
+async def _do_signal(chat_id: int, interval: str) -> str:
+    s = await get_settings(chat_id)
+    symbol = s["symbol"]
+    try:
+        klines = await fetch_klines(symbol, interval, 200)
+    except Exception as e:
+        return f"❌ Couldn't load candles for `{symbol}`: {e}"
+
+    result = find_order_block_signal(klines)
+    if result is None:
+        return f"No clean order block / break of structure found on `{symbol}` {interval.upper()} right now — try a different timeframe."
+
+    d = result
+    icon = "🟢" if d["direction"] == "bullish" else "🔴"
+    lines = [
+        f"🎯 *{symbol}* — {interval.upper()} Signal",
+        f"Current price: `{d['current_price']:,.2f}`",
+        f"Bias: {icon} {d['direction']}",
+        "",
+        f"Order block zone: `{d['ob_low']:,.2f}` – `{d['ob_high']:,.2f}`",
+        f"Suggested entry: `{d['entry']:,.2f}`  ({d['note']})",
+        "",
+        "*Fib levels of this leg:*",
+    ]
+    for r in FIB_RATIOS:
+        lines.append(f"  {r*100:.1f}%  →  `{d['levels'][r]:,.2f}`")
+    lines.append("")
+    lines.append("_Simplified ICT-style read (order block + fib retracement), not a precise replica of manual charting. Not financial advice._")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -549,18 +782,15 @@ async def alert_check(context: ContextTypes.DEFAULT_TYPE):
     s = await get_settings(chat_id)
     if not s.get("alert_on"):
         return
-    cluster_pct = CLUSTER_PRESETS.get(s["cluster_level"], CLUSTER_PRESETS["mid"])
-    ready, price, buy_walls, sell_walls = await get_big_walls(
-        s["symbol"], s["threshold_qty"], s["range_abs"], s["top_n"], cluster_pct
-    )
+    ready, price, buy_walls, sell_walls = await get_big_walls(s["symbol"], s["threshold_qty"], s["range_abs"])
     if not ready:
         return
 
     current = {}
     for p, q, ts in buy_walls:
-        current[("buy", zone_key(p, price, cluster_pct))] = (p, q)
+        current[("buy", zone_key(p, price))] = (p, q)
     for p, q, ts in sell_walls:
-        current[("sell", zone_key(p, price, cluster_pct))] = (p, q)
+        current[("sell", zone_key(p, price))] = (p, q)
 
     state = alert_state.setdefault(chat_id, {"primed": False, "seen": set()})
     current_keys = set(current.keys())
@@ -598,76 +828,25 @@ def remove_alert_job(job_queue, chat_id: int):
 
 
 # ---------------------------------------------------------------------------
-# AI chat mode (/chat) -- powered by Google's free Gemini API
-# ---------------------------------------------------------------------------
-chat_histories: dict[int, list[dict]] = {}  # chat_id -> list of {"role":..,"parts":[{"text":..}]}
-MAX_HISTORY_TURNS = 10  # keep last N exchanges (user+model pairs)
-
-
-async def call_gemini(chat_id: int, user_text: str) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return "⚠️ AI chat isn't set up yet — GEMINI_API_KEY is missing on the server."
-
-    history = chat_histories.setdefault(chat_id, [])
-    history.append({"role": "user", "parts": [{"text": user_text}]})
-    history[:] = history[-(MAX_HISTORY_TURNS * 2):]
-
-    payload = {"contents": history}
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.post(
-                GEMINI_URL,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            log.exception("gemini call failed")
-            return f"⚠️ AI request failed: {e}"
-
-    try:
-        reply_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        reply_text = "⚠️ AI didn't return a usable response, try again."
-
-    history.append({"role": "model", "parts": [{"text": reply_text}]})
-    history[:] = history[-(MAX_HISTORY_TURNS * 2):]
-    return reply_text
-
-
-async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update_setting(chat_id, "chat_mode", True)
-    chat_histories[chat_id] = []
-    await update.message.reply_text(
-        "🤖 *AI chat mode on.* Just type your question, send it like a normal message.\n"
-        "Type /endchat to exit back to bot commands.",
-        parse_mode="Markdown",
-    )
-
-
-async def endchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update_setting(chat_id, "chat_mode", False)
-    chat_histories.pop(chat_id, None)
-    await update.message.reply_text("✅ AI chat mode off. Back to normal commands.")
-
-
-async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    s = await get_settings(chat_id)
-    if not s.get("chat_mode"):
-        return  # not in chat mode, ignore plain text
-    thinking = await update.message.reply_text("🤖 thinking...")
-    reply_text = await call_gemini(chat_id, update.message.text)
-    await thinking.edit_text(reply_text)
-
-
-# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
+HELP_TEXT = (
+    "*Commands*\n"
+    "/symbol — quick-pick a pair, or /symbol SYM to type one\n"
+    "/threshold N — min wall size, in base asset\n"
+    "/range N — ± price points around current price\n"
+    "/receive — snapshot now (exact walls, no cap)\n"
+    "/get — snapshot now, with wall age\n"
+    "/liq — nearest big wall (≥300) on each side\n"
+    "/ta — RSI/EMA/Fibonacci technicals + wall confluence\n"
+    "/signal — order block + fib entry read (pick 1H/4H/8H)\n"
+    "/time 7:00pm — daily auto report (Bangkok time)\n"
+    "/timeoff — turn off daily report\n"
+    "/alert on|off — live push when a new big wall appears\n"
+    "/status — live order book sync status"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = await get_settings(chat_id)
@@ -685,47 +864,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-HELP_TEXT = (
-    "*Commands*\n"
-    "/symbol SYM — set trading pair (e.g. BTCUSDT)\n"
-    "/threshold N — min wall size, in base asset\n"
-    "/range N — ± price points around current price\n"
-    "/cluster exact|low|mid|high — wall grouping tightness\n"
-    "/receive — snapshot now\n"
-    "/get — snapshot now, with wall age\n"
-    "/liq — nearest big wall to current price\n"
-    "/time 7:00pm — daily auto report (Bangkok time)\n"
-    "/timeoff — turn off daily report\n"
-    "/alert on|off — live push when a new big wall appears\n"
-    "/status — live order book sync status\n"
-    "/chat — enter AI chat mode (ask anything)\n"
-    "/endchat — leave AI chat mode"
-)
-
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
-async def set_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Usage: /symbol BTCUSDT")
-        return
-    symbol = context.args[0].upper()
+async def _apply_symbol(chat_id: int, symbol: str, responder):
+    symbol = symbol.upper()
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             r = await client.get(f"{BINANCE_FAPI_BASE}/fapi/v1/ticker/price", params={"symbol": symbol})
             r.raise_for_status()
         except httpx.HTTPStatusError:
-            await update.message.reply_text(f"❌ `{symbol}` not found on Futures.", parse_mode="Markdown")
+            await responder(f"❌ `{symbol}` not found on Futures.", parse_mode="Markdown")
             return
     await update_setting(chat_id, "symbol", symbol)
     await book_manager.ensure(symbol)
-    await update.message.reply_text(
+    await responder(
         f"✅ Symbol set to `{symbol}` — syncing its order book now, give it a few seconds.",
         parse_mode="Markdown",
     )
+
+
+async def set_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Pick a symbol:", reply_markup=symbol_keyboard())
+        return
+    await _apply_symbol(chat_id, context.args[0], update.message.reply_text)
 
 
 async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -760,19 +925,6 @@ async def set_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update_setting(chat_id, "range_abs", value)
     await update.message.reply_text(f"✅ Range set to ±{value:,.0f} price points")
-
-
-async def set_cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Pick a cluster tightness:", reply_markup=cluster_keyboard())
-        return
-    if context.args[0].lower() not in CLUSTER_PRESETS:
-        await update.message.reply_text("Usage: /cluster exact | low | mid | high")
-        return
-    level = context.args[0].lower()
-    await update_setting(chat_id, "cluster_level", level)
-    await update.message.reply_text(f"✅ Cluster tightness set to *{level}*", parse_mode="Markdown")
 
 
 async def set_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -839,6 +991,23 @@ async def liq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def ta_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text("⏳ Crunching technicals...")
+    text = await _do_ta(chat_id)
+    await msg.edit_text(text, parse_mode="Markdown")
+
+
+async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if context.args and context.args[0].lower() in ("1h", "4h", "8h"):
+        msg = await update.message.reply_text("⏳ Reading structure...")
+        text = await _do_signal(chat_id, context.args[0].lower())
+        await msg.edit_text(text, parse_mode="Markdown")
+        return
+    await update.message.reply_text("Pick a timeframe:", reply_markup=signal_interval_keyboard())
+
+
 async def receive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text("⏳ Reading live order book...")
@@ -886,14 +1055,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_setting(chat_id, "daily_time", None)
             await query.message.reply_text("✅ Daily report turned off.")
 
-        elif data.startswith("cluster:"):
-            level = data.split(":", 1)[1]
-            await update_setting(chat_id, "cluster_level", level)
-            await query.message.reply_text(f"✅ Cluster tightness set to *{level}*", parse_mode="Markdown")
-
         elif data.startswith("alert:"):
             turn_on = data.split(":", 1)[1] == "on"
             await _apply_alert_choice(chat_id, turn_on, context.job_queue, query.message.reply_text)
+
+        elif data == "symbol:others":
+            await query.message.reply_text("Type /symbol SYMBOL to set a custom pair, e.g. /symbol ADAUSDT")
+
+        elif data.startswith("symbol:"):
+            symbol = data.split(":", 1)[1]
+            await _apply_symbol(chat_id, symbol, query.message.reply_text)
+
+        elif data == "ta":
+            msg = await query.message.reply_text("⏳ Crunching technicals...")
+            text = await _do_ta(chat_id)
+            await msg.edit_text(text, parse_mode="Markdown")
+
+        elif data == "signal":
+            await query.message.reply_text("Pick a timeframe:", reply_markup=signal_interval_keyboard())
+
+        elif data.startswith("signal:"):
+            interval = data.split(":", 1)[1]
+            msg = await query.message.reply_text("⏳ Reading structure...")
+            text = await _do_signal(chat_id, interval)
+            await msg.edit_text(text, parse_mode="Markdown")
 
     except Exception as e:
         log.exception("button callback failed")
@@ -919,8 +1104,6 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable first.")
-    if not os.environ.get("GEMINI_API_KEY"):
-        log.warning("GEMINI_API_KEY not set -- /chat will reply with a setup warning until it is.")
 
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
@@ -930,18 +1113,19 @@ def main():
     app.add_handler(CommandHandler("symbol", set_symbol))
     app.add_handler(CommandHandler("threshold", set_threshold))
     app.add_handler(CommandHandler("range", set_range))
-    app.add_handler(CommandHandler("cluster", set_cluster))
     app.add_handler(CommandHandler("time", set_time_cmd))
     app.add_handler(CommandHandler("timeoff", timeoff_cmd))
     app.add_handler(CommandHandler("alert", alert_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("liq", liq_cmd))
+    app.add_handler(CommandHandler("ta", ta_cmd))
+    app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("receive", receive_command))
     app.add_handler(CommandHandler("get", get_command))
-    app.add_handler(CommandHandler("chat", chat_cmd))
-    app.add_handler(CommandHandler("endchat", endchat_cmd))
-    app.add_handler(CallbackQueryHandler(button_callback, pattern="^(receive|get|status|help|timeoff|cluster:.*|alert:.*)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
+    app.add_handler(CallbackQueryHandler(
+        button_callback,
+        pattern="^(receive|get|status|help|timeoff|alert:.*|symbol:.*|ta|signal|signal:.*)$",
+    ))
 
     log.info("Bot starting (polling)...")
     app.run_polling()
