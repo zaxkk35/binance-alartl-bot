@@ -567,78 +567,75 @@ def fib_from_swing(highs, lows, lookback):
     return direction, lo, hi, levels
 
 
-def find_order_block_signal(klines):
-    """Simplified ICT-style order block + fib confluence.
-    Not a precise replica of manual chart reading -- a heuristic read."""
+ENTRY_RATIOS = [0.618, 0.649]
+TP_RATIO = 1.01
+RISK_REWARD = 1.3  # stop distance = TP distance / 1.3
+
+
+def find_fib_extension_signal(klines):
+    """Trend-Based Fib Extension strategy:
+    P1 -> P2 defines the impulsive swing, P3 is the pullback point the
+    extension is projected from. Entry = price touching the 0.618 or 0.649
+    extension level from P3; TP = the 1.01 extension level from P3;
+    stop-loss distance = TP distance / 1.3 (not placed at swing low/high)."""
     n = len(klines)
     if n < 20:
         return None
     highs = [k["high"] for k in klines]
     lows = [k["low"] for k in klines]
     closes = [k["close"] for k in klines]
-    opens = [k["open"] for k in klines]
 
     swing_highs, swing_lows = [], []
     for i in range(3, n - 3):
         if highs[i] == max(highs[i - 3:i + 4]):
-            swing_highs.append((i, highs[i]))
+            swing_highs.append((i, "H", highs[i]))
         if lows[i] == min(lows[i - 3:i + 4]):
-            swing_lows.append((i, lows[i]))
-    if not swing_highs or not swing_lows:
+            swing_lows.append((i, "L", lows[i]))
+    tagged = sorted(swing_highs + swing_lows, key=lambda t: t[0])
+    if len(tagged) < 3:
         return None
 
-    last_sh_idx, last_sh_price = swing_highs[-1]
-    last_sl_idx, last_sl_price = swing_lows[-1]
+    p1_idx, p1_type, p1 = tagged[-3]
+    p2_idx, p2_type, p2 = tagged[-2]
+    p3_idx, p3_type, p3 = tagged[-1]
 
-    bullish_bos_idx = next((i for i in range(last_sh_idx + 1, n) if closes[i] > last_sh_price), None)
-    bearish_bos_idx = next((i for i in range(last_sl_idx + 1, n) if closes[i] < last_sl_price), None)
+    if not (p1_type != p2_type and p2_type != p3_type and p1_type == p3_type):
+        return None  # must alternate H-L-H or L-H-L
 
-    candidates = []
-    if bullish_bos_idx is not None:
-        candidates.append(("bullish", bullish_bos_idx, last_sh_idx))
-    if bearish_bos_idx is not None:
-        candidates.append(("bearish", bearish_bos_idx, last_sl_idx))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda c: c[1], reverse=True)
-    direction, bos_idx, swing_idx = candidates[0]
-
-    ob_idx = None
-    rng = range(bos_idx - 1, swing_idx - 1, -1)
-    for i in rng:
-        if direction == "bullish" and closes[i] < opens[i]:
-            ob_idx = i
-            break
-        if direction == "bearish" and closes[i] > opens[i]:
-            ob_idx = i
-            break
-    if ob_idx is None:
-        ob_idx = swing_idx
-
-    ob_low, ob_high = lows[ob_idx], highs[ob_idx]
-
-    if direction == "bullish":
-        leg_low = ob_low
-        leg_high = max(highs[bos_idx:n])
-        levels = {r: leg_high - (leg_high - leg_low) * r for r in FIB_RATIOS}
+    if p1_type == "L" and p2_type == "H":
+        direction = "long"
+        if p3 <= p1:
+            return None  # P3 must be a HIGHER low than P1
+        move = p2 - p1
+        entry_levels = {r: p3 + move * r for r in ENTRY_RATIOS}
+        tp = p3 + move * TP_RATIO
     else:
-        leg_high = ob_high
-        leg_low = min(lows[bos_idx:n])
-        levels = {r: leg_low + (leg_high - leg_low) * r for r in FIB_RATIOS}
+        direction = "short"
+        if p3 >= p1:
+            return None  # P3 must be a LOWER high than P1
+        move = p1 - p2
+        entry_levels = {r: p3 - move * r for r in ENTRY_RATIOS}
+        tp = p3 - move * TP_RATIO
 
-    matches = [(r, p) for r, p in levels.items() if ob_low <= p <= ob_high]
-    if matches:
-        matches.sort(key=lambda m: m[0], reverse=True)
-        entry_ratio, entry_price = matches[0]
-        note = f"{int(entry_ratio*100)}% fib lands inside the order block"
+    current_price = closes[-1]
+    plans = {}
+    for r, entry in entry_levels.items():
+        reward = abs(tp - entry)
+        stop_dist = reward / RISK_REWARD
+        sl = entry - stop_dist if direction == "long" else entry + stop_dist
+        plans[r] = {"entry": entry, "sl": sl, "reward": reward, "stop_dist": stop_dist}
+
+    lo_entry = min(e["entry"] for e in plans.values())
+    hi_entry = max(e["entry"] for e in plans.values())
+    if direction == "long":
+        triggered = current_price <= hi_entry
     else:
-        entry_price = (ob_low + ob_high) / 2
-        note = "no fib level falls inside the order block — using its midpoint"
+        triggered = current_price >= lo_entry
 
     return {
-        "direction": direction, "ob_low": ob_low, "ob_high": ob_high,
-        "levels": levels, "entry": entry_price, "note": note,
-        "current_price": closes[-1],
+        "direction": direction, "p1": p1, "p2": p2, "p3": p3,
+        "plans": plans, "tp": tp, "current_price": current_price,
+        "triggered": triggered,
     }
 
 
@@ -719,26 +716,28 @@ async def _do_signal(chat_id: int, interval: str) -> str:
     except Exception as e:
         return f"❌ Couldn't load candles for `{symbol}`: {e}"
 
-    result = find_order_block_signal(klines)
-    if result is None:
-        return f"No clean order block / break of structure found on `{symbol}` {interval.upper()} right now — try a different timeframe."
+    d = find_fib_extension_signal(klines)
+    if d is None:
+        return f"No clean P1→P2→P3 swing pattern found on `{symbol}` {interval.upper()} right now — try a different timeframe."
 
-    d = result
-    icon = "🟢" if d["direction"] == "bullish" else "🔴"
+    icon = "🟢" if d["direction"] == "long" else "🔴"
+    status = "✅ price is inside/through the entry zone" if d["triggered"] else "⏳ price hasn't reached an entry level yet"
     lines = [
-        f"🎯 *{symbol}* — {interval.upper()} Signal",
+        f"🎯 *{symbol}* — {interval.upper()} Fib Extension Signal",
         f"Current price: `{d['current_price']:,.2f}`",
-        f"Bias: {icon} {d['direction']}",
+        f"Bias: {icon} {d['direction']}   ({status})",
         "",
-        f"Order block zone: `{d['ob_low']:,.2f}` – `{d['ob_high']:,.2f}`",
-        f"Suggested entry: `{d['entry']:,.2f}`  ({d['note']})",
+        f"P1 `{d['p1']:,.2f}`  →  P2 `{d['p2']:,.2f}`  →  P3 (pullback) `{d['p3']:,.2f}`",
         "",
-        "*Fib levels of this leg:*",
+        "*Entry levels:*",
     ]
-    for r in FIB_RATIOS:
-        lines.append(f"  {r*100:.1f}%  →  `{d['levels'][r]:,.2f}`")
+    for r in ENTRY_RATIOS:
+        p = d["plans"][r]
+        lines.append(f"  {r} → entry `{p['entry']:,.2f}`  |  SL `{p['sl']:,.2f}`  |  risk {p['stop_dist']:,.2f} pts (1.3R)")
     lines.append("")
-    lines.append("_Simplified ICT-style read (order block + fib retracement), not a precise replica of manual charting. Not financial advice._")
+    lines.append(f"TP (1.01 extension): `{d['tp']:,.2f}`")
+    lines.append("")
+    lines.append("_Trend-based fib extension strategy. Not financial advice — verify against your own charts before risking money._")
     return "\n".join(lines)
 
 
